@@ -1,204 +1,96 @@
+import gc
+import tempfile
+from pathlib import Path
+
+import fitz  # PyMuPDF
 import streamlit as st
-from pypdf import PdfReader, PdfWriter
-from pypdf.errors import PdfReadError
 from PIL import Image
 from docx import Document
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-import tempfile
-from pathlib import Path
 
-# ---------------------------
-# Configuración
-# ---------------------------
-st.set_page_config(page_title="Unir PDFs Jurisdiccional", layout="wide")
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+st.set_page_config(
+    page_title="Unir PDFs Jurisdiccional",
+    page_icon="📄",
+    layout="wide",
+)
 
-# ---------------------------
-# Rutas
-# ---------------------------
 BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "images"
-
 LOGO_SIC = IMAGES_DIR / "logo_sic.png"
 LOGO_COL = IMAGES_DIR / "logo_colombia.png"
 
-# ---------------------------
-# FUNCIONES DE CONVERSIÓN
-# ---------------------------
-def imagen_a_pdf(path_img):
-    image = Image.open(path_img)
+# Límites preventivos. Ajustarlos NO aumenta la RAM ni el almacenamiento
+# disponibles en Streamlit Community Cloud.
+MAX_TOTAL_UPLOAD_GB = 1.0
+MAX_DOWNLOAD_MB = 500
+SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "jfif", "docx"]
+IMAGE_TYPES = {"png", "jpg", "jpeg", "jfif"}
 
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-
-    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    image.save(temp_pdf.name)
-
-    return temp_pdf.name
-
-
-def docx_a_pdf(path_docx):
-    doc = Document(path_docx)
-
-    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    c = canvas.Canvas(temp_pdf.name, pagesize=letter)
-
-    y = 750
-
-    for p in doc.paragraphs:
-        c.drawString(50, y, p.text)
-        y -= 15
-
-        if y < 50:
-            c.showPage()
-            y = 750
-
-    c.save()
-
-    return temp_pdf.name
+# ============================================================
+# CONVERSIONES
+# ============================================================
+def imagen_a_pdf(origen: Path, destino: Path) -> None:
+    """Convierte una imagen a PDF. La imagen se conserva sin OCR."""
+    with Image.open(origen) as image:
+        # PDF necesita RGB o escala de grises. La conversión no aplica OCR.
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        image.save(destino, format="PDF", resolution=150.0)
 
 
-# ---------------------------
-# ENCABEZADO
-# ---------------------------
-c1, c2, c3 = st.columns([1, 4, 1])
+def docx_a_pdf(origen: Path, destino: Path) -> None:
+    """
+    Conversión básica de texto DOCX a PDF.
+    Nota: no reproduce fielmente tablas, imágenes, encabezados ni formato complejo.
+    Para fidelidad de Word se recomienda LibreOffice en un servidor de procesamiento.
+    """
+    doc = Document(str(origen))
+    pdf = canvas.Canvas(str(destino), pagesize=letter)
+    page_width, page_height = letter
+    left_margin = 50
+    y = page_height - 55
+    line_height = 15
 
-with c1:
-    if LOGO_COL.exists():
-        st.image(str(LOGO_COL), use_container_width=True)
+    for paragraph in doc.paragraphs:
+        text = paragraph.text or ""
+        # Evita que una línea larga salga del área imprimible.
+        max_chars = 95
+        lines = [text[i:i + max_chars] for i in range(0, len(text), max_chars)] or [""]
 
-with c2:
-    st.markdown("## 📄 Unir PDFs Delegatura para Asuntos Jurisdiccionales")
-    st.markdown(
-        """
-        <style>
-        .texto-fucsia{
-            color:#C2185B !important;
-            font-size:14px;
-        }
-        </style>
+        for line in lines:
+            if y < 50:
+                pdf.showPage()
+                y = page_height - 55
+            pdf.drawString(left_margin, y, line)
+            y -= line_height
 
-        <p class="texto-fucsia">
-        Herramienta para unir múltiples documentos (PDF, imágenes y Word) en un solo archivo.
-        </p>
-        """,
-        unsafe_allow_html=True
-    )
+    pdf.save()
 
-with c3:
-    if LOGO_SIC.exists():
-        st.image(str(LOGO_SIC), use_container_width=True)
 
-# ---------------------------
-# CARGA DE ARCHIVOS
-# ---------------------------
-st.subheader("Cargar archivos")
+def escribir_upload_en_disco(uploaded_file, destino: Path) -> None:
+    """Escribe el contenido del UploadedFile en un temporal por bloques."""
+    uploaded_file.seek(0)
+    with destino.open("wb") as output:
+        while True:
+            chunk = uploaded_file.read(4 * 1024 * 1024)  # 4 MB
+            if not chunk:
+                break
+            output.write(chunk)
+    uploaded_file.seek(0)
 
-uploaded_files = st.file_uploader(
-    "Selecciona archivos (PDF, PNG, JPG, JPEG, JFIF, DOCX)",
-    type=["pdf", "png", "jpg", "jpeg", "jfif", "docx"],
-    accept_multiple_files=True
-)
 
-# ---------------------------
-# PROCESAMIENTO
-# ---------------------------
-if uploaded_files:
+def agregar_pdf_al_documento(pdf_path: Path, resultado: fitz.Document, nombre: str):
+    """Añade páginas al PDF final sin rasterizar ni recomprimir las páginas PDF."""
+    source = None
+    try:
+        source = fitz.open(str(pdf_path))
 
-    total = len(uploaded_files)
-
-    st.success(f"✅ {total} archivos cargados")
-
-    with st.expander("📂 Ver lista completa"):
-        for i, archivo in enumerate(uploaded_files, start=1):
-            st.write(f"{i}. {archivo.name}")
-
-    if st.button("🔗 Unir archivos"):
-
-        merger = PdfWriter()
-        progress = st.progress(0)
-
-        try:
-
-            for i, uploaded_file in enumerate(uploaded_files):
-
-                suffix = uploaded_file.name.split(".")[-1].lower()
-
-                temp_file = tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix="." + suffix
-                )
-
-                temp_file.write(uploaded_file.read())
-                temp_file.flush()
-
-                path = temp_file.name
-
-                # ---------------------
-                # Convertir imágenes
-                # ---------------------
-                if suffix in ["png", "jpg", "jpeg", "jfif"]:
-                    path = imagen_a_pdf(path)
-
-                # ---------------------
-                # Convertir Word
-                # ---------------------
-                elif suffix == "docx":
-                    path = docx_a_pdf(path)
-
-                # ---------------------
-                # Leer PDF
-                # ---------------------
-                try:
-
-                    reader = PdfReader(path)
-
-                    if reader.is_encrypted:
-
-                        try:
-                            reader.decrypt("")
-                        except Exception:
-                            st.error(
-                                f"❌ El archivo '{uploaded_file.name}' está protegido con contraseña y no puede unirse."
-                            )
-                            continue
-
-                    for page in reader.pages:
-                        merger.add_page(page)
-
-                except PdfReadError as e:
-                    st.error(f"❌ No fue posible leer '{uploaded_file.name}'")
-                    st.exception(e)
-                    continue
-
-                progress.progress((i + 1) / total)
-
-            # ---------------------
-            # Guardar PDF final
-            # ---------------------
-            output_path = tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=".pdf"
-            ).name
-
-            merger.write(output_path)
-            merger.close()
-
-            with open(output_path, "rb") as f:
-                pdf_bytes = f.read()
-
-            st.success("✅ Archivos unidos correctamente")
-
-            st.download_button(
-                "📥 Descargar PDF unido",
-                pdf_bytes,
-                file_name="pdf_unido_jurisdiccional.pdf",
-                mime="application/pdf"
-            )
-
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
- 
-
-#### cd "C:\Users\jbohorquez\OneDrive - Directorio SIC\Escritorio\ASUNTOS_JURISDICCIONALES\AUTOMATIZACIONES\ilove_jurs_pdf"      
-# streamlit run app.py     
+        if source.is_encrypted:
+            # Solo intenta abrir PDF protegidos con contraseña vacía.
+            if not source.authenticate(""):
+                raise ValueError(
+                    f"El PDF '{nombre}' está protegido con contraseña."
