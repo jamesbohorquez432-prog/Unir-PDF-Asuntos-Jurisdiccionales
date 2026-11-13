@@ -91,6 +91,7 @@ def agregar_pdf_al_documento(pdf_path: Path, resultado: fitz.Document, nombre: s
 
         if source.is_encrypted:
             # Solo intenta abrir PDF protegidos con contraseña vacía.
-            if not source.authenticate(""):
-                raise ValueError(
-                    f"El PDF '{nombre}' está protegido con contraseña."
+       if not source.authenticate(""):
+        raise ValueError(
+        f"El PDF '{nombre}' está protegido con contraseña."
+    )
